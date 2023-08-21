@@ -9,84 +9,6 @@ from tensorflow.keras import layers
 import numpy as np
 
 
-def GetLocalFeat(pc,outsize):
-    '''Return local features from embedded point cloud
-    Input: point cloud shaped as (B,N,k,NFEAT)
-    '''
-
-    features = layers.Conv2D(outsize, kernel_size=[1,1],activation=None)(pc)
-    features = layers.LeakyReLU(alpha=0.01)(features) 
-    features = layers.Conv2D(outsize, kernel_size=[1,1],activation=None)(features)
-    features = layers.LeakyReLU(alpha=0.01)(features) 
-    features = tf.reduce_mean(features, axis=-2)    
-    return features
-
-
-
-def GetEdgeFeat(point_cloud, nn_idx, k=20):
-    """Construct edge feature for each point
-    Args:
-    point_cloud: (batch_size, num_points, 1, num_dims) 
-    nn_idx: (batch_size, num_points, k)
-    k: int
-    Returns:
-    edge features: (batch_size, num_points, k, num_dims)
-    """
-
-
-
-    point_cloud_central = point_cloud
-
-    batch_size = tf.shape(point_cloud)[0]
-    num_points = tf.shape(point_cloud)[1]
-    num_dims = point_cloud.get_shape()[2]
-
-    idx_ = tf.range(batch_size) * num_points
-    idx_ = tf.reshape(idx_, [batch_size, 1, 1]) 
-    point_cloud_flat = tf.reshape(point_cloud, [-1, num_dims])
-    point_cloud_neighbors = tf.gather(point_cloud_flat, nn_idx+idx_)
-    
-    point_cloud_central = tf.expand_dims(point_cloud_central, axis=-2)
-
-    point_cloud_central = tf.tile(point_cloud_central, [1, 1, k, 1])
-    edge_feature = tf.concat([point_cloud_central, point_cloud_neighbors-point_cloud_central], axis=-1)
-    return edge_feature
-
-def pairwise_distance(point_cloud,mask): 
-    """Compute pairwise distance of a point cloud.
-    Args:
-      point_cloud: tensor (batch_size, num_points, num_dims)
-    Returns:
-      pairwise distance: (batch_size, num_points, num_points)
-    """
-
-    point_cloud_transpose = tf.transpose(point_cloud, perm=[0, 2, 1]) 
-    point_cloud_inner = tf.matmul(point_cloud, point_cloud_transpose) # x.x + y.y + z.z shape: NxN
-    point_cloud_inner = -2*point_cloud_inner
-    point_cloud_square = tf.reduce_sum(tf.square(point_cloud), axis=-1, keepdims=True) # from x.x, y.y, z.z to x.x + y.y + z.z
-    point_cloud_square_tranpose = tf.transpose(point_cloud_square, perm=[0, 2, 1])
-
-    if mask != None:
-        zero_mask = 10000*mask
-        zero_mask_transpose = tf.transpose(zero_mask, perm=[0, 2, 1])
-        zero_mask = zero_mask + zero_mask_transpose
-        zero_mask = tf.where(tf.equal(zero_mask,20000),tf.zeros_like(zero_mask),zero_mask)
-        point_cloud_square += zero_mask
-        
-    return point_cloud_square + point_cloud_inner + point_cloud_square_tranpose
-
-
-def knn(adj_matrix, k=20):
-    """Get KNN based on the pairwise distance.
-    Args:
-      pairwise distance: (batch_size, num_points, num_points)
-      k: int
-    Returns:
-      nearest neighbors: (batch_size, num_points, k)
-    """
-    neg_adj = -adj_matrix
-    _, nn_idx = tf.math.top_k(neg_adj, k=k)  # values, indices
-    return nn_idx
 
 
 def DeepSetsAtt(
@@ -107,6 +29,8 @@ def DeepSetsAtt(
 
     
     masked_inputs = layers.Masking(mask_value=0.0,name='Mask')(inputs)
+    masked_features = Dense(projection_dim,activation=None)(masked_inputs)
+    masked_features = layers.LeakyReLU(alpha=0.01)(masked_features)
     
     #Include the time information as an additional feature fixed for all particles
     time = layers.Dense(2*projection_dim,activation=None)(time_embedding)
@@ -115,85 +39,74 @@ def DeepSetsAtt(
 
     time = layers.Reshape((1,-1))(time)
     time = tf.tile(time,(1,tf.shape(inputs)[1],1))
-
-    if use_dist:
-        k=7
-        adj = pairwise_distance(masked_inputs[:,:,1:3],mask) #only eta-phi
-        nn_idx = knn(adj, k=k)
-        edge_feature = GetEdgeFeat(masked_inputs, nn_idx=nn_idx, k=k)
-        masked_features = GetLocalFeat(edge_feature,projection_dim)
-    else:
-        masked_features = TimeDistributed(Dense(projection_dim,activation=None))(masked_inputs)
-
-    
+        
     #Use the deepsets implementation with attention, so the model learns the relationship between particles in the event
-    tdd = TimeDistributed(Dense(projection_dim,activation=None))(tf.concat([masked_features,time],-1))
+    concat = layers.Concatenate(-1)([masked_features,time])
+    tdd = TimeDistributed(Dense(projection_dim,activation=None))(concat)
     tdd = TimeDistributed(layers.LeakyReLU(alpha=0.01))(tdd)
     encoded_patches = TimeDistributed(Dense(projection_dim))(tdd)
-
 
     mask_matrix = tf.matmul(mask,tf.transpose(mask,perm=[0,2,1]))
     
     for _ in range(num_transformer):
         # Layer normalization 1.
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        #x1 =encoded_patches
+        x1 = TimeDistributed(layers.LayerNormalization(epsilon=1e-6))(encoded_patches)
 
         # Create a multi-head attention layer.
         attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=projection_dim//num_heads)(x1, x1, attention_mask=tf.cast(mask_matrix,tf.bool))
+            num_heads=num_heads,key_dim=projection_dim//num_heads
+        )(x1, x1, attention_mask=tf.cast(mask_matrix,tf.bool))
+        
         # Skip connection 1.
         x2 = layers.Add()([attention_output, encoded_patches])
             
-        # Layer normalization 2.
-        time_cond = layers.Dense(projection_dim,activation=None)(time)
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)        
-        x3 = layers.Dense(2*projection_dim,activation="gelu")(tf.concat([x3,time_cond],-1))
-        x3 = layers.Dense(projection_dim,activation="gelu")(x3)
+        # Layer normalization 2.        
+        x3 = TimeDistributed(layers.LayerNormalization(epsilon=1e-6))(x2)        
+        x3 = TimeDistributed(layers.Dense(4*projection_dim,activation="gelu"))(x3)
+        x3 = TimeDistributed(layers.Dense(projection_dim,activation="gelu"))(x3)
 
-        # Skip connection 2.
         encoded_patches = layers.Add()([x3, x2])
         
 
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    
-    representation = TimeDistributed(Dense(2*projection_dim,activation=None))(tdd+representation)    
+    representation = TimeDistributed(layers.LayerNormalization(epsilon=1e-6))(encoded_patches)
+
+    representation_mean = layers.GlobalAvgPool1D()(representation)
+    representation_mean = layers.Concatenate(-1)([representation_mean,time_embedding])
+    representation_mean = layers.Reshape((1,-1))(representation_mean)
+    representation_mean = tf.tile(representation_mean,(1,tf.shape(inputs)[1],1))
+
+    add = layers.Concatenate(-1)([tdd,representation,representation_mean])
+    representation =  TimeDistributed(Dense(2*projection_dim,activation=None))(add)    
     representation =  TimeDistributed(layers.LeakyReLU(alpha=0.01))(representation)
     outputs = TimeDistributed(Dense(num_feat,activation=None,kernel_initializer="zeros"))(representation)
+
     
     return  inputs, outputs
 
 
-def DeepSetsClass(
-        #num_part,
-        num_feat,
-        num_heads=1,
-        num_transformer = 8,
-        projection_dim=256,
-        mask = None,
-):
+def make_patches(inputs,projection_dim):
+    tdd = Dense(projection_dim,activation=None)(inputs)
+    tdd = layers.LeakyReLU(alpha=0.01)(tdd)
+    encoded_patches = Dense(projection_dim)(tdd)
+    return encoded_patches
 
+def encode(inputs,projection_dim):
+    masked_inputs = layers.Masking(mask_value=0.0)(inputs)
+    masked_features = Dense(projection_dim,activation=None)(masked_inputs)
+    masked_features = layers.LeakyReLU(alpha=0.01)(masked_features)
+    return masked_features
 
-    inputs = Input((None,num_feat))
-    masked_inputs = layers.Masking(mask_value=0.0,name='Mask')(inputs)
-        
-    #Use the deepsets implementation with attention, so the model learns the relationship between particles in the event
-    tdd = TimeDistributed(Dense(projection_dim,activation=None))(masked_inputs)
-    tdd = TimeDistributed(layers.LeakyReLU(alpha=0.01))(tdd)
-    encoded_patches = TimeDistributed(Dense(projection_dim))(tdd)
-
-    mask_matrix = tf.matmul(mask,tf.transpose(mask,perm=[0,2,1]))
-    
+def transformer(encoded_patches,num_transformer,num_heads,
+                projection_dim,mask_matrix=None,attention_axes=(1,2)):
     for _ in range(num_transformer):
         # Layer normalization 1.
         x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        #x1 =encoded_patches
 
         # Create a multi-head attention layer.
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim//num_heads,
-            dropout=0.1)(x1, x1, attention_mask=tf.cast(mask_matrix,tf.bool))
+            attention_axes = attention_axes,
+            dropout=0.1)(x1, x1, attention_mask=tf.cast(mask_matrix,tf.bool) if mask_matrix is not None else None)
         # Skip connection 1.
         x2 = layers.Add()([attention_output, encoded_patches])
             
@@ -204,18 +117,61 @@ def DeepSetsClass(
 
         # Skip connection 2.
         encoded_patches = layers.Add()([x3, x2])
-        
-
     representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    
-    representation = TimeDistributed(Dense(projection_dim,activation=None))(tdd+representation)    
-    representation =  TimeDistributed(layers.LeakyReLU(alpha=0.01))(representation)
+    return representation
 
-    merged = tf.reduce_mean(representation,1)
+
+
+def DeepSetsClass(
+        inputs_jet,
+        inputs_particle,
+        num_heads=1,
+        num_transformer = 8,
+        projection_dim=256,
+        mask = None,
+        use_cond = False,
+        cond_embedding = None
+):
+    
+    
+    masked_features = encode(inputs_particle,projection_dim)
+    jet_features = encode(inputs_jet,projection_dim)
+
+    mask_matrix = tf.matmul(mask,tf.transpose(mask,perm=[0,1,3,2]))
+        
+    if use_cond:
+        pass
+        cond = layers.Dense(2*projection_dim,activation=None)(cond_embedding)
+        cond = layers.LeakyReLU(alpha=0.01)(cond)
+        cond = layers.Dense(projection_dim)(cond)        
+        cond = layers.Reshape((1,1,-1))(cond)
+        cond = tf.tile(cond,(1,2,tf.shape(inputs_particle)[2],1))        
+        masked_features = layers.Concatenate(-1)([masked_features,cond])
+
+
+    encoded_patches = make_patches(masked_features,projection_dim)
+    representation = transformer(encoded_patches,num_transformer,num_heads,      
+                                 projection_dim,mask_matrix,attention_axes=(2))
+    representation = layers.Reshape((-1,projection_dim))(representation)
+    representation = layers.GlobalAvgPool1D()(representation)
+    
+    encoded_patches_jet = make_patches(jet_features,projection_dim)
+    representation_jet = transformer(encoded_patches_jet,num_transformer,num_heads,      
+                                     projection_dim,attention_axes=(1))
+    representation_jet = layers.GlobalAvgPool1D()(representation_jet)
+
+    
+    merged = layers.Concatenate(-1)([representation,representation_jet])
+    merged = Dense(2*projection_dim,activation=None)(merged)    
+    merged = layers.LeakyReLU(alpha=0.01)(merged)
+    #merged = layers.GlobalAvgPool1D()(merged)
+    
+    merged = layers.LeakyReLU(alpha=0.01)(layers.Dense(2*projection_dim)(merged))
+    merged = layers.Dropout(0.1)(merged)
     merged = layers.LeakyReLU(alpha=0.01)(layers.Dense(projection_dim)(merged))    
     outputs = Dense(1,activation='sigmoid')(merged)
     
-    return  inputs, outputs
+    return   outputs
 
 
 
