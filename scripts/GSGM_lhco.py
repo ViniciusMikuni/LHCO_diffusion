@@ -4,9 +4,10 @@ from tensorflow import keras
 from tensorflow.keras import layers, Input
 import time
 #import horovod.tensorflow.keras as hvd
+import horovod.tensorflow as hvd
 import utils
 from deepsets_cond import DeepSetsAtt, Resnet
-from tensorflow.keras.activations import swish, relu
+from tensorflow.keras.activations import swish, relu, tanh
 
 # tf and friends
 tf.random.set_seed(1234)
@@ -21,9 +22,8 @@ class GSGM(keras.Model):
             raise ValueError("Config file not given")
 
 
-
         self.activation = swish
-        # self.activation = relu
+        #self.activation = layers.LeakyReLU(alpha=0.01)
         self.num_feat = self.config['NUM_FEAT']
         self.num_jet = self.config['NUM_JET']
         self.num_cond = self.config['NUM_COND']
@@ -86,7 +86,6 @@ class GSGM(keras.Model):
 
         self.model_part = keras.Model(inputs=[inputs,inputs_time,inputs_jet,inputs_cond,inputs_mask],
                                       outputs=outputs)
-
         
 
         inputs,outputs = DeepSetsAtt(
@@ -139,7 +138,7 @@ class GSGM(keras.Model):
     def FF(self,features):
         #Gaussian features to the inputs
         max_proj = 8
-        min_proj = 6
+        min_proj = 4
         freq = tf.range(start=min_proj, limit=max_proj, dtype=tf.float32)
         freq = 2.**(freq) * 2 * np.pi        
 
@@ -155,6 +154,13 @@ class GSGM(keras.Model):
         b = tf.math.atan(tf.exp(-0.5 * logsnr_max))
         a = tf.math.atan(tf.exp(-0.5 * logsnr_min)) - b
         return -2. * tf.math.log(tf.math.tan(a * tf.cast(t,tf.float32) + b))
+
+    @tf.function
+    def inv_logsnr_schedule_cosine(self,logsnr, logsnr_min=-20., logsnr_max=20.):
+        b = tf.math.atan(tf.exp(-0.5 * logsnr_max))
+        a = tf.math.atan(tf.exp(-0.5 * logsnr_min)) - b
+        return tf.math.atan(tf.exp(-0.5 * tf.cast(logsnr,tf.float32)))/a -b/a
+
     
     @tf.function
     def get_logsnr_alpha_sigma(self,time):
@@ -162,22 +168,8 @@ class GSGM(keras.Model):
         alpha = tf.sqrt(tf.math.sigmoid(logsnr))
         sigma = tf.sqrt(tf.math.sigmoid(-logsnr))
         
-        return logsnr, tf.reshape(alpha,self.shape), tf.reshape(sigma,self.shape)
-
-
-    # def train_step(self, inputs):
-    #     if self.train_jet:
-    #         return self.train_jet_step(inputs)
-    #     else:
-    #         return self.train_part_step(inputs)
-
-    # def test_step(self, inputs):
-    #     if self.train_jet:
-    #         return self.test_jet_step(inputs)
-    #     else:
-    #         return self.test_part_step(inputs)
-
-
+        
+        return tf.reshape(logsnr,self.shape), tf.reshape(alpha,self.shape), tf.reshape(sigma,self.shape)
 
     @tf.function
     def train_step(self, inputs):
@@ -198,6 +190,7 @@ class GSGM(keras.Model):
             loss_jet = tf.reduce_mean(tf.reshape(losses,(tf.shape(losses)[0], -1)))
 
         trainable_variables = self.model_jet.trainable_variables
+        tape = hvd.DistributedGradientTape(tape)
         g = tape.gradient(loss_jet, trainable_variables)
         g = [tf.clip_by_norm(grad, 1)
              for grad in g]
@@ -212,7 +205,8 @@ class GSGM(keras.Model):
         part = tf.reshape(part,(-1,num_part,self.num_feat))
         mask = tf.reshape(mask,(-1,num_part,1))
         jet = tf.reshape(jet,(-1,self.num_jet))
-        cond = tf.concat([cond,cond],0)
+        cond = tf.expand_dims(cond,1)
+        cond = tf.reshape(tf.tile(cond,(1,2)),(-1,1))
 
         random_t = tf.random.uniform((tf.shape(cond)[0],1))        
         _, alpha, sigma = self.get_logsnr_alpha_sigma(random_t)
@@ -224,7 +218,7 @@ class GSGM(keras.Model):
             z = tf.random.normal((tf.shape(part)),dtype=tf.float32)*mask
             # print(alpha.shape,part.shape , z.shape , sigma.shape)
             perturbed_x = alpha*part + z * sigma
-            pred = self.model_part([perturbed_x, random_t,jet,cond,mask])
+            pred = self.model_part([perturbed_x*mask, random_t,jet,cond,mask])
             
             v = alpha * z - sigma * part
             losses = tf.square(pred - v)*mask
@@ -232,6 +226,7 @@ class GSGM(keras.Model):
             loss_part = tf.reduce_mean(tf.reshape(losses,(tf.shape(losses)[0], -1)))
             
         trainable_variables = self.model_part.trainable_variables
+        tape = hvd.DistributedGradientTape(tape)
         g = tape.gradient(loss_part, trainable_variables)
         g = [tf.clip_by_norm(grad, 1)
              for grad in g]
@@ -274,7 +269,9 @@ class GSGM(keras.Model):
         part = tf.reshape(part,(-1,num_part,self.num_feat))
         mask = tf.reshape(mask,(-1,num_part,1))
         jet = tf.reshape(jet,(-1,self.num_jet))
-        cond = tf.concat([cond,cond],0)
+        cond = tf.expand_dims(cond,1)
+        cond = tf.reshape(tf.tile(cond,(1,2)),(-1,1))
+        #cond = tf.concat([cond,cond],0)
 
         random_t = tf.random.uniform((tf.shape(cond)[0],1))        
         _, alpha, sigma = self.get_logsnr_alpha_sigma(random_t)
@@ -305,7 +302,7 @@ class GSGM(keras.Model):
     def call(self,x):        
         return self.model(x)
 
-    def generate(self,cond,jets):
+    def generate(self,cond):
         start = time.time()
         jets = self.DDPMSampler(cond,self.ema_jet,
                                 data_shape=[cond.shape[0],2,self.num_jet],
@@ -370,8 +367,9 @@ class GSGM(keras.Model):
         eps = pred_noises
 
         
-        return mean,eps    
-        
+        return mean,eps
+
+    
     
 
     @tf.function
@@ -422,5 +420,7 @@ class GSGM(keras.Model):
             
         # The last step does not include any noise
         return mean        
+
+
 
 

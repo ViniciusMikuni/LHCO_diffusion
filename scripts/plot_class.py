@@ -46,24 +46,24 @@ class PlottingConfig():
     def get_binning(self):
         if 'jet' in self.name:
             binning_dict = {
-                0 : np.linspace(1000,2500,35),
-                1 : np.linspace(-2.5,2.5,30),
-                2 : np.linspace(-1.5,1.5,30),
-                3 : np.linspace(100,1100,35),
-                4 : np.linspace(1,100.,100),
+                0 : np.linspace(1000,2500,55),
+                1 : np.linspace(-2.5,2.5,50),
+                2 : np.linspace(-1.5,1.5,50),
+                3 : np.linspace(100,1100,55),
+                4 : np.linspace(1,200.,200),
             }
         elif 'High' in self.name:
             binning_dict = {
-                0 : np.linspace(100,550,35),
-                1 : np.linspace(0,600.0,30),
-                2 : np.linspace(0,500.0,30),
-                3 : np.linspace(0,400.0,30),
+                0 : np.linspace(100,550,55),
+                1 : np.linspace(0,600.0,50),
+                2 : np.linspace(0,500.0,50),
+                3 : np.linspace(0,400.0,50),
             }
         else:
             binning_dict = {
-                0 : np.linspace(0,0.9,40),
-                1 : np.linspace(-1,1,30),
-                2 : np.linspace(-1,1,30),
+                0 : np.linspace(0,0.9,60),
+                1 : np.linspace(-1,1,50),
+                2 : np.linspace(-1,1,50),
             }
             
         return binning_dict[self.idx]

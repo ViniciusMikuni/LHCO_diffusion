@@ -27,15 +27,15 @@ def DeepSetsAtt(
     if mask is None:
         mask = tf.ones_like(inputs[:,:,:1])
 
-    
     masked_inputs = layers.Masking(mask_value=0.0,name='Mask')(inputs)
-    masked_features = Dense(projection_dim,activation=None)(masked_inputs)
+    
+    masked_features = TimeDistributed(Dense(projection_dim,activation=None))(masked_inputs)
     masked_features = layers.LeakyReLU(alpha=0.01)(masked_features)
     
     #Include the time information as an additional feature fixed for all particles
-    time = layers.Dense(2*projection_dim,activation=None)(time_embedding)
+    time = layers.Dense(projection_dim,activation=None)(time_embedding)
     time = layers.LeakyReLU(alpha=0.01)(time)
-    time = layers.Dense(projection_dim)(time)
+    #time = layers.Dense(projection_dim)(time)
 
     time = layers.Reshape((1,-1))(time)
     time = tf.tile(time,(1,tf.shape(inputs)[1],1))
@@ -70,15 +70,10 @@ def DeepSetsAtt(
 
     representation = TimeDistributed(layers.LayerNormalization(epsilon=1e-6))(encoded_patches)
 
-    representation_mean = layers.GlobalAvgPool1D()(representation)
-    representation_mean = layers.Concatenate(-1)([representation_mean,time_embedding])
-    representation_mean = layers.Reshape((1,-1))(representation_mean)
-    representation_mean = tf.tile(representation_mean,(1,tf.shape(inputs)[1],1))
-
-    add = layers.Concatenate(-1)([tdd,representation,representation_mean])
+    add = layers.Concatenate(-1)([tdd,representation])
     representation =  TimeDistributed(Dense(2*projection_dim,activation=None))(add)    
     representation =  TimeDistributed(layers.LeakyReLU(alpha=0.01))(representation)
-    outputs = TimeDistributed(Dense(num_feat,activation=None,kernel_initializer="zeros"))(representation)
+    outputs = TimeDistributed(Dense(num_feat,activation=None))(representation)
 
     
     return  inputs, outputs
@@ -90,8 +85,9 @@ def make_patches(inputs,projection_dim):
     encoded_patches = Dense(projection_dim)(tdd)
     return encoded_patches
 
-def encode(inputs,projection_dim):
+def encode(inputs,projection_dim,mask=None):
     masked_inputs = layers.Masking(mask_value=0.0)(inputs)
+    #masked_inputs = layers.Masking(mask_value=0.0)(inputs)
     masked_features = Dense(projection_dim,activation=None)(masked_inputs)
     masked_features = layers.LeakyReLU(alpha=0.01)(masked_features)
     return masked_features
@@ -112,7 +108,7 @@ def transformer(encoded_patches,num_transformer,num_heads,
             
         # Layer normalization 2.
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)        
-        x3 = layers.Dense(2*projection_dim,activation="gelu")(x3)
+        x3 = layers.Dense(4*projection_dim,activation="gelu")(x3)
         x3 = layers.Dense(projection_dim,activation="gelu")(x3)
 
         # Skip connection 2.
@@ -130,45 +126,47 @@ def DeepSetsClass(
         projection_dim=256,
         mask = None,
         use_cond = False,
-        cond_embedding = None
+        cond_embedding = None,
 ):
     
+    npart = tf.shape(inputs_particle)[2]
+    inputs_reshape = tf.reshape(inputs_particle,(-1,npart,tf.shape(inputs_particle)[3]))
+    mask_reshape = tf.reshape(mask,(-1,npart,1))
     
-    masked_features = encode(inputs_particle,projection_dim)
+    masked_features = encode(inputs_reshape,projection_dim,mask_reshape)
     jet_features = encode(inputs_jet,projection_dim)
 
-    mask_matrix = tf.matmul(mask,tf.transpose(mask,perm=[0,1,3,2]))
+    mask_matrix = tf.matmul(mask_reshape,tf.transpose(mask_reshape,perm=[0,2,1]))
         
     if use_cond:
-        pass
-        cond = layers.Dense(2*projection_dim,activation=None)(cond_embedding)
+        cond = layers.Dense(projection_dim,activation=None)(cond_embedding)
         cond = layers.LeakyReLU(alpha=0.01)(cond)
-        cond = layers.Dense(projection_dim)(cond)        
-        cond = layers.Reshape((1,1,-1))(cond)
-        cond = tf.tile(cond,(1,2,tf.shape(inputs_particle)[2],1))        
+        cond = layers.Reshape((1,-1))(cond)
+        cond = tf.tile(cond,(1,2*npart,1))
+        cond = tf.reshape(cond,(-1,npart,projection_dim))
         masked_features = layers.Concatenate(-1)([masked_features,cond])
 
 
     encoded_patches = make_patches(masked_features,projection_dim)
     representation = transformer(encoded_patches,num_transformer,num_heads,      
-                                 projection_dim,mask_matrix,attention_axes=(2))
-    representation = layers.Reshape((-1,projection_dim))(representation)
-    representation = layers.GlobalAvgPool1D()(representation)
+                                 projection_dim,mask_matrix,attention_axes=(1))
+    representation = tf.reshape(representation,(-1,2*npart,projection_dim))
     
     encoded_patches_jet = make_patches(jet_features,projection_dim)
     representation_jet = transformer(encoded_patches_jet,num_transformer,num_heads,      
                                      projection_dim,attention_axes=(1))
-    representation_jet = layers.GlobalAvgPool1D()(representation_jet)
+
 
     
-    merged = layers.Concatenate(-1)([representation,representation_jet])
-    merged = Dense(2*projection_dim,activation=None)(merged)    
-    merged = layers.LeakyReLU(alpha=0.01)(merged)
-    #merged = layers.GlobalAvgPool1D()(merged)
-    
-    merged = layers.LeakyReLU(alpha=0.01)(layers.Dense(2*projection_dim)(merged))
+    #merged = layers.Concatenate(-1)([representation,representation_jet])
+    merged = tf.concat([representation,representation_jet],-2)
+    merged = Dense(2*projection_dim,activation=None)(merged)
     merged = layers.Dropout(0.1)(merged)
-    merged = layers.LeakyReLU(alpha=0.01)(layers.Dense(projection_dim)(merged))    
+    merged = layers.LeakyReLU(alpha=0.01)(merged)
+    merged = layers.GlobalAvgPool1D()(merged)
+    
+    merged = layers.LeakyReLU(alpha=0.01)(layers.Dense(projection_dim)(merged))
+    merged = layers.Dropout(0.1)(merged)
     outputs = Dense(1,activation='sigmoid')(merged)
     
     return   outputs

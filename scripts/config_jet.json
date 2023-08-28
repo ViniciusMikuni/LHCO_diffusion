@@ -11,5 +11,5 @@
     'NORM':'mean',
     'MJJMAX':5000,
     'MJJMIN':2300,
-    'MODEL_NAME':'FPCD_LHCO_100'
+    'MODEL_NAME':'FPCD_LHCO'
 }

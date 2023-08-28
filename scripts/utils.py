@@ -8,6 +8,7 @@ import matplotlib.ticker as mtick
 from sklearn.utils import shuffle
 import tensorflow as tf
 import pandas as pd
+import energyflow as ef
 
 #import energyflow as ef
 
@@ -31,7 +32,7 @@ name_translate={
 
 def reweight(data_j,data_p,model,mjj):
     mask = data_p[:,:,:,0]!=0
-    weights = model.predict([data_j,data_p,mask,mjj], batch_size=10000,)
+    weights = model.predict([data_j,data_p,mask,mjj], batch_size=1000,)
     weights = np.squeeze(np.ma.divide(weights,1.0-weights).filled(0))
     weights *= 1.0*weights.shape[0]/np.sum(weights)
     return weights
@@ -92,17 +93,11 @@ def PlotRoutine(feed_dict,xlabel='',ylabel='',reference_name='gen'):
     ax1 = plt.subplot(gs[1],sharex=ax0)
 
     for ip,plot in enumerate(feed_dict.keys()):
-        if 'steps' in plot or 'r=' in plot:
-            ax0.plot(np.mean(feed_dict[plot],0),label=plot,marker=line_style[plot],color=colors[plot],lw=0)
-        else:
-            ax0.plot(np.mean(feed_dict[plot],0),label=plot,linestyle=line_style[plot],color=colors[plot])
+        ax0.plot(np.mean(feed_dict[plot],0),label=plot,linestyle=line_style[plot],color=colors[plot])
         if reference_name!=plot:
             ratio = 100*np.divide(np.mean(feed_dict[reference_name],0)-np.mean(feed_dict[plot],0),np.mean(feed_dict[reference_name],0))
             #ax1.plot(ratio,color=colors[plot],marker='o',ms=10,lw=0,markerfacecolor='none',markeredgewidth=3)
-            if 'steps' in plot or 'r=' in plot:
-                ax1.plot(ratio,color=colors[plot],markeredgewidth=1,marker=line_style[plot],lw=0)
-            else:
-                ax1.plot(ratio,color=colors[plot],linewidth=2,linestyle=line_style[plot])
+            ax1.plot(ratio,color=colors[plot],linewidth=2,linestyle=line_style[plot])
                 
         
     FormatFig(xlabel = "", ylabel = ylabel,ax0=ax0)
@@ -113,7 +108,7 @@ def PlotRoutine(feed_dict,xlabel='',ylabel='',reference_name='gen'):
     plt.axhline(y=0.0, color='r', linestyle='--',linewidth=1)
     plt.axhline(y=10, color='r', linestyle='--',linewidth=1)
     plt.axhline(y=-10, color='r', linestyle='--',linewidth=1)
-    plt.ylim([-100,100])
+    plt.ylim([-30,30])
 
     return fig,ax0
 
@@ -192,7 +187,7 @@ def HistRoutine(feed_dict,
         plt.axhline(y=0.0, color='r', linestyle='-',linewidth=1)
         # plt.axhline(y=10, color='r', linestyle='--',linewidth=1)
         # plt.axhline(y=-10, color='r', linestyle='--',linewidth=1)
-        plt.ylim([-100,100])
+        plt.ylim([-30,30])
     else:
         FormatFig(xlabel = xlabel, ylabel = ylabel,ax0=ax0)
     
@@ -210,41 +205,38 @@ def SaveJson(save_file,data):
 
 
 def SimpleLoader(data_path,file_name,use_SR=False,
-                 load_signal=False,npart=100,mjjmin=2300,mjjmax=5000):
+                 npart=100,mjjmin=2300,mjjmax=5000):
 
-    
-    lhco = pd.read_hdf(
-        os.path.join(data_path,file_name)).to_numpy().astype(np.float32)[:]
+
+    with h5.File(os.path.join(data_path,file_name),"r") as h5f:
+        particles = h5f['constituents'][:]
+        jets = h5f['jet_data'][:]
+        mask = h5f['mask'][:]
+        particles = np.concatenate([particles,mask],-1)
+
 
     if not use_SR:
         #Load validation split
-        nevts = lhco.shape[0]
-        lhco = lhco[int(0.6*nevts):]
+        particles = particles[:int(0.65*jets.shape[0])]
+        mask = mask[:int(0.65*jets.shape[0])]
+        jets = jets[:int(0.65*jets.shape[0])]
     
-    parts = lhco[:,14:14+2*npart*3].reshape(-1,2*npart,3)
-    mjj = lhco[:,-2]
-    label = lhco[:,-1]
-    
-    jet1 = lhco[:,:4]
-    jet2 = lhco[:,7:11]
-
-    if load_signal:
-        mask_label = label==1
-    else:
-        mask_label = label==0
-    #Ensure there are 2 jets
-    mask_mass = (jet1[:,0]!=0.0) & (jet2[:,0]!=0.0)
+        
+    p4_jets = ef.p4s_from_ptyphims(jets)
+    # get mjj from p4_jets
+    sum_p4 = p4_jets[:, 0] + p4_jets[:, 1]
+    mjj = ef.ms_from_p4s(sum_p4)
+    jets = np.concatenate([jets,np.sum(mask,-2)],-1)    
 
     # train using only the sidebands
 
     mask_region = get_mjj_mask(mjj,use_SR,mjjmin,mjjmax)
-    parts = parts[(mask_label) & (mask_region) & (mask_mass)]
-    mjj = mjj[(mask_label) & (mask_region) & (mask_mass)]
-    jet1 = jet1[(mask_label) & (mask_region) & (mask_mass)]
-    jet2 = jet2[(mask_label) & (mask_region) & (mask_mass)]
-
-    #print(parts[0])
-    particles,jets = convert_inputs(parts,jet1,jet2)    
+    mask_mass = (np.abs(jets[:,0,0])>0.0) & (np.abs(jets[:,1,0])>0.0)
+    
+    particles = particles[(mask_region) & (mask_mass)]
+    mjj = mjj[(mask_region) & (mask_mass)]
+    jets = jets[(mask_region) & (mask_mass)]
+    jets[:,:,-1][jets[:,:,-1]<0] = 0.
     
     mask = np.expand_dims(particles[:,:,:,-1],-1)
     return particles[:,:,:,:-1]*mask,jets,mjj
@@ -263,13 +255,8 @@ def revert_npart(npart,max_npart,norm=None):
         print("ERROR: give a normalization method!")
     return np.round(x).astype(np.int32)
      
-def revert_logit(x):
-    alpha = 1e-6
-    exp = np.exp(x)
-    x = exp/(1+exp)
-    return (x-alpha)/(1 - 2*alpha)                
 
-def ReversePrep(particles,jets,npart,norm=None):
+def ReversePrep(particles,jets,mjj,npart,norm=None):
     alpha = 1e-6
     data_dict = LoadJson('preprocessing_{}.json'.format(npart))
     num_part = particles.shape[2]
@@ -278,6 +265,9 @@ def ReversePrep(particles,jets,npart,norm=None):
     jets=jets.reshape(-1,jets.shape[-1])
     mask = np.expand_dims(particles[:,0]!=0,-1)
 
+    mjj_tile = np.expand_dims(mjj,1)
+    mjj_tile = np.reshape(np.tile(mjj_tile,(1,2)),(-1))
+    
     def _revert(x,name='jet'):
         if norm == 'mean':
             x = x*data_dict['std_{}'.format(name)] + data_dict['mean_{}'.format(name)]
@@ -291,112 +281,28 @@ def ReversePrep(particles,jets,npart,norm=None):
     particles = _revert(particles,'particle')
     jets = _revert(jets,'jet')
         
-    jets[:,0] = np.exp(jets[:,0])
+    jets[:,0] = np.exp(jets[:,0])*mjj_tile
     jets[:,4] = np.round(jets[:,4])
     jets[:,4] = np.clip(jets[:,4],1,npart)
     
     #1 particle jets have 0 mass
     mask_mass = jets[:,4]>1.0
-    jets[:,3] = np.exp(jets[:,3])*mask_mass
+    jets[:,3] = np.exp(jets[:,3])*mask_mass*mjj_tile
     
     particles[:,0] = 1.0 - np.exp(particles[:,0])
-    particles[:,0] = np.clip(particles[:,0],3.142093e-05,1.0) #apply min pt cut
+    particles[:,0] = np.clip(particles[:,0],2.5349376295699686e-05,1.0) #apply min pt cut
 
         
     return (particles*mask).reshape(batch_size,2,num_part,-1),jets.reshape(batch_size,2,-1)
 
-
-def convert_to_polar(jet):
-    new_jet = np.zeros_like(jet)
-    new_jet[:,0] = np.sqrt(jet[:,0]**2 + jet[:,1]**2) #pt
-    new_jet[:,1] = np.arcsinh(np.ma.divide(jet[:,2],new_jet[:,0]).filled(0))
-    new_jet[:,2] = np.arctan2(jet[:,1],jet[:,0])
-    new_jet[:,3] = jet[:,3]
-    return new_jet
+def LoadMjjFile(folder,file_name,use_SR,mjjmin=2300,mjjmax=5000):    
+    with h5.File(os.path.join(folder,file_name),"r") as h5f:
+        mjj = h5f['mjj'][:]
 
 
-def val_inputs(parts,jet1,jet2,mjj,nparts=100):
-    test_results = []
-
-    #1 Verify mjj is right
-    def _get_mjj(jet1,jet2):
-        e12 = np.sum(jet1[:,:3]**2,-1) + jet1[:,3]**2
-        e22 = np.sum(jet2[:,:3]**2,-1) + jet2[:,3]**2
-
-        sume = np.sqrt(e12) + np.sqrt(e22)        
-        sump = jet1[:,:3] + jet2[:,:3]
-
-        mjj2 = sume**2 - np.sum(sump**2,-1)
-        return np.sqrt(np.abs(mjj2))
-
-    test_results.append(np.isclose(mjj,_get_mjj(jet1,jet2)))
-
-    #2 Verify parts give jet back
-
-    def _get_jet(parts):
-        e = np.sqrt(np.sum(parts**2,-1))
-        sume = np.sum(e,1)        
-        sump = np.sum(parts,1)
-        mj2 = sume**2 - np.sum(sump**2,-1)
-        return sump,np.sqrt(np.abs(mj2))
-
-    sump1,mj1 = _get_jet(parts[:,:nparts])
-
-    # print(jet1[:,-1],mj1)
-    # test_results.append(np.isclose(jet1[:,-1],mj1))
-    # print(jet1[:,:3] , sump1)
-    # input()
-    # print(np.isclose(jet1[:,:3],sump1))
-    # test_results.append(np.isclose(jet1[:,:3],sump1))
-    return test_results
-
-
-def convert_inputs(parts,jet1,jet2,npart=100):
-
-    jet1 = convert_to_polar(jet1)
-    jet2 = convert_to_polar(jet2)
-
-    #particles
-    pt = np.sqrt(parts[:,:,0]**2 + parts[:,:,1]**2)
-
-    #replace the jet pT for HT
-    # jet1_HT = np.sum(pt[:,:npart],1)
-    # jet2_HT = np.sum(pt[:,npart:],1)
-    # jet1[:,0]=jet1_HT
-    # jet2[:,0]=jet2_HT
-    
-    mask = (pt>0).astype(np.float32)
-    
-    eta = np.arcsinh(np.ma.divide(parts[:,:,2],pt).filled(0)) 
-    phi = np.arctan2(parts[:,:,1],parts[:,:,0])*mask
-
-
-    pt[:,:npart]  /=jet1[:,0].reshape(-1,1)
-    # print(np.min(pt[pt>0]))
-    # input()
-    eta[:,:npart] -=jet1[:,1].reshape(-1,1)
-    phi[:,:npart] -=jet1[:,2].reshape(-1,1)
-    
-    pt[:,npart:]  /=jet2[:,0].reshape(-1,1)
-    eta[:,npart:] -=jet2[:,1].reshape(-1,1)
-    phi[:,npart:] -=jet2[:,2].reshape(-1,1)
-    
-    phi[phi>np.pi] -= 2*np.pi
-    phi[phi<-np.pi] += 2*np.pi 
-    
-    particles = np.stack([pt,eta*mask,phi*mask,mask],-1).reshape(-1,2,npart,4)
-    
-    npart1 = np.sum(mask[:,:npart],-1)
-    npart2 = np.sum(mask[:,npart:],-1)
-
-
-    jet1 = np.concatenate([jet1,npart1.reshape(-1,1)],-1)
-    jet2 = np.concatenate([jet2,npart2.reshape(-1,1)],-1)
-
-    
-    jets = np.stack([jet1,jet2],1)
-
-    return particles,jets
+    mask = get_mjj_mask(mjj,use_SR,mjjmin,mjjmax)
+    logmjj = prep_mjj(mjj)
+    return logmjj[mask]
 
 def revert_mjj(mjj,mjjmin=2300,mjjmax=5000):
     x = (mjj + 1.0)/2.0
@@ -424,10 +330,13 @@ def DataLoader(data_path,file_name,
     particles = []
     jets = []
 
-    def _preprocessing(particles,jets,save_json=False):
+    def _preprocessing(particles,jets,mjj,save_json=False):
         num_part = particles.shape[2]
         batch_size = particles.shape[0]
 
+        jets[:,:,0] = jets[:,:,0]/np.expand_dims(mjj,-1)
+        jets[:,:,3] = jets[:,:,3]/np.expand_dims(mjj,-1)
+        
         particles=particles.reshape(-1,particles.shape[-1]) #flatten
         jets=jets.reshape(-1,jets.shape[-1]) #flatten
 
@@ -436,6 +345,7 @@ def DataLoader(data_path,file_name,
         particles[:,0] = np.ma.log(1.0 - particles[:,0]).filled(0)
         jets[:,0] = np.log(jets[:,0])
         jets[:,3] = np.ma.log(jets[:,3]).filled(0)
+
         
         if save_json:
             mask = particles[:,-1]
@@ -468,80 +378,64 @@ def DataLoader(data_path,file_name,
         particles = particles.reshape(batch_size,2,num_part,-1)
         jets = jets.reshape(batch_size,2,-1)
         return particles.astype(np.float32),jets.astype(np.float32)
+
+    
             
+    with h5.File(os.path.join(data_path,file_name),"r") as h5f:
+        nevts = h5f['jet_data'][:].shape[0]
+        particles = h5f['constituents'][:]
+        jets = h5f['jet_data'][:]
+        mask = h5f['mask'][:]
+        particles = np.concatenate([particles,mask],-1)
 
-    # lhco = pd.read_hdf(
-    #     os.path.join(data_path,file_name)).columns.values
-    # print(lhco[14:14+2*30*3])
-    # input()
 
-    nevts = pd.read_hdf(
-    os.path.join(data_path,file_name)).to_numpy().shape[0]
-
-    if make_tf_data:
-        lhco = pd.read_hdf(
-            os.path.join(data_path,file_name)).to_numpy().astype(np.float32)[rank:int(0.6*nevts):size]
-    else:
-        if use_SR:
-            lhco = pd.read_hdf(
-                os.path.join(data_path,file_name)).to_numpy().astype(np.float32)[:]
-        else:
-            lhco = pd.read_hdf(
-                os.path.join(data_path,file_name)).to_numpy().astype(np.float32)[int(0.6*nevts):]
-
-    
-    parts = lhco[:,14:14+2*npart*3].reshape(-1,2*npart,3)
-    mjj = lhco[:,-2]    
-    label = lhco[:,-1]
-    jet1 = lhco[:,:4]
-
-    jet2 = lhco[:,7:11]
-    #keep background only
-    mask_label = label==0
-    mask_mass = (np.abs(jet1[:,0])>0.0) & (np.abs(jet2[:,0])>0.0)
-
-    
-
+    p4_jets = ef.p4s_from_ptyphims(jets)
+    # get mjj from p4_jets
+    sum_p4 = p4_jets[:, 0] + p4_jets[:, 1]
+    mjj = ef.ms_from_p4s(sum_p4)
+    jets = np.concatenate([jets,np.sum(mask,-2)],-1)
     # train using only the sidebands
     mask_region = get_mjj_mask(mjj,use_SR,mjjmin,mjjmax)
-        
-    parts = parts[(mask_label) & (mask_region) & (mask_mass)]
-    mjj = mjj[(mask_label) & (mask_region) & (mask_mass)]
-    jet1 = jet1[(mask_label) & (mask_region) & (mask_mass)]
-    jet2 = jet2[(mask_label) & (mask_region) & (mask_mass)]
+    mask_mass = (np.abs(jets[:,0,0])>0.0) & (np.abs(jets[:,1,0])>0.0)
 
-    # Not sure but some jets have negative mass
-    jet1[:,-1][jet1[:,-1]<0] = 0.
-    jet2[:,-1][jet2[:,-1]<0] = 0.
+    particles = particles[(mask_region) & (mask_mass)]
+    mjj = mjj[(mask_region) & (mask_mass)]
+    jets = jets[(mask_region) & (mask_mass)]
+    jets[:,:,-1][jets[:,:,-1]<0] = 0.
 
-    assert  np.all(val_inputs(parts,jet1,jet2,mjj)), "ERROR: you messed up son"
+    if make_tf_data:
+        particles = particles[rank:int(0.65*nevts):size]
+        jets = jets[rank:int(0.65*nevts):size]
+        mjj = mjj[rank:int(0.65*nevts):size]
+    else:
+        if not use_SR:
+            particles = particles[int(0.65*nevts):]
+            jets = jets[int(0.65*nevts):]
+            mjj = mjj[int(0.65*nevts):]
+            
     
-    # Go from cartesian to polar coordinates
-    particles,jets = convert_inputs(parts,jet1,jet2)
     particles,jets,mjj = shuffle(particles,jets,mjj, random_state=0)
-
     data_size = jets.shape[0]
 
-    particles,jets = _preprocessing(particles,jets)
+    particles,jets = _preprocessing(particles,jets,mjj)
     
     #normalize mjj to range [-1,1]
     mjj = prep_mjj(mjj,mjjmin,mjjmax)
     
     # input("done")
     if make_tf_data:
-        train_particles = particles[:int(0.8*data_size)]
-        train_jets = jets[:int(0.8*data_size)]
-        train_mjj = mjj[:int(0.8*data_size)]
+        #roughly 60% train and 5% test
+        train_particles = particles[:int(0.9*data_size)]
+        train_jets = jets[:int(0.9*data_size)]
+        train_mjj = mjj[:int(0.9*data_size)]
         
-        test_particles = particles[int(0.8*data_size):]
-        test_jets = jets[int(0.8*data_size):]
-        test_mjj = mjj[int(0.8*data_size):]
+        test_particles = particles[int(0.9*data_size):]
+        test_jets = jets[int(0.9*data_size):]
+        test_mjj = mjj[int(0.9*data_size):]
         
-        data_size = int(0.8*data_size)
+        data_size = int(0.9*data_size)
     
         def _prepare_batches(particles,jets,mjj):
-            # print(np.min(mjj),np.max(mjj))
-            # input()
             tf_cond = tf.data.Dataset.from_tensor_slices(mjj)
             tf_jet = tf.data.Dataset.from_tensor_slices(jets)
             mask = np.expand_dims(particles[:,:,:,-1],-1)
@@ -559,6 +453,6 @@ def DataLoader(data_path,file_name,
         return data_size, train_data,test_data
     
     else:
-        nevts = -1
+        nevts = 200000
         mask = np.expand_dims(particles[:nevts,:,:,-1],-1)
         return particles[:nevts,:,:,:-1]*mask,jets[:nevts],mjj[:nevts], mask

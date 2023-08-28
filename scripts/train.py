@@ -25,12 +25,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()    
     parser.add_argument('--config', default='config_jet.json', help='Config file with training parameters')
-    parser.add_argument('--file_name', default='events_anomalydetection_v2.features_with_jet_constituents_100.h5', help='File to load')
-    parser.add_argument('--npart', default=100, type=int, help='Maximum number of particles')
+    parser.add_argument('--file_name', default='processed_data_background_rel.h5', help='File to load')
+    parser.add_argument('--npart', default=279, type=int, help='Maximum number of particles')
     parser.add_argument('--data_path', default='/global/cfs/cdirs/m3929/LHCO/', help='Path containing the training files')
-    parser.add_argument('--distill', action='store_true', default=False,help='Use the distillation model')
     parser.add_argument('--load', action='store_true', default=False,help='Load trained model')
-    #parser.add_argument('--train_jet', action='store_true', default=False,help='Train jet model alone')
+
 
 
     flags = parser.parse_args()
@@ -73,7 +72,7 @@ if __name__ == "__main__":
     callbacks = [
         hvd.callbacks.BroadcastGlobalVariablesCallback(0),
         hvd.callbacks.MetricAverageCallback(),
-        EarlyStopping(patience=40,restore_best_weights=True),
+        EarlyStopping(patience=50,restore_best_weights=True),
     ]
 
         
