@@ -17,17 +17,54 @@ from sklearn.utils import shuffle
 from sklearn.model_selection import train_test_split
 from tensorflow.keras import  Input
 from tensorflow.keras.callbacks import ModelCheckpoint,EarlyStopping
+import energyflow as ef
 
-def combine_part_jet(jet,particle,mjj,npart):
-    new_j = np.copy(jet).reshape((-1,jet.shape[-1]))
-    new_p = np.copy(particle).reshape((-1,particle.shape[-1]))
+def recover_jet(jet,part):
+    new_j = np.copy(jet)
+    new_p = np.copy(part)
+    new_p[:,:,:,0]*=np.expand_dims(jet[:,:,0],-1)
+    new_p[:,:,:,1]+=np.expand_dims(jet[:,:,1],-1)
+    new_p[:,:,:,2]+=np.expand_dims(jet[:,:,2],-1)
+
+    #fix phi
+    new_p[:,:,:,2] = np.clip(new_p[:,:,:,2],-np.pi,np.pi)
+    # new_p[:,:,:,2][new_p[:,:,:,2]>np.pi] -= 2*np.pi
+    # new_p[:,:,:,2][new_p[:,:,:,2]<-np.pi] += 2*np.pi
     
+    mask = np.expand_dims(new_p[:,:,:,0]!=0,-1)
+    new_p*=mask
+
+    new_p = ef.p4s_from_ptyphims(new_p)
+    jets = np.sum(new_p,2)
+    jets = ef.ptyphims_from_p4s(jets)
+    new_j[:,:,0] = jets[:,:,0]
+    new_j[:,:,1] = ef.etas_from_p4s(np.sum(new_p,2))
+    new_j[:,:,2] = np.clip(jets[:,:,2] - np.pi,-np.pi,np.pi)
+    new_j[:,:,3] = jets[:,:,3]
+    mjj = ef.ms_from_p4s(np.sum(new_p,(1,2)))
+    
+    return new_j.reshape((-1,jet.shape[-1])), mjj
+    
+def apply_mjj_cut(j,p,mjj,use_SR,mjjmin,mjjmax):
+    mask = utils.get_mjj_mask(mjj,use_SR,mjjmin,mjjmax)
+    return j[mask],p[mask],mjj[mask]
+
+def combine_part_jet(jet,particle,mjj,npart,jet_from_cond=True):
+
+    if jet_from_cond:
+        new_j = np.copy(jet).reshape((-1,jet.shape[-1]))        
+    else:
+        new_j,mjj = recover_jet(jet,particle)
+
+    
+    new_p = np.copy(particle).reshape((-1,particle.shape[-1]))    
     mask = new_p[:,0]!=0
 
     #Apply the same transformations used during training
     mjj_tile = np.expand_dims(mjj,1)
     mjj_tile = np.reshape(np.tile(mjj_tile,(1,2)),(-1))
     new_j[:,0] = np.log(new_j[:,0]/mjj_tile)
+    new_j[:,2] = np.clip(new_j[:,2] - np.pi,-np.pi,np.pi) #clip phi
     new_j[:,3] = np.ma.log(new_j[:,3]/mjj_tile).filled(0)
     new_p[:,0] = np.ma.log(1.0 - new_p[:,0]).filled(0)
     
@@ -39,11 +76,12 @@ def combine_part_jet(jet,particle,mjj,npart):
 
     # print("Mean jet: {}, std jet: {}".format(np.mean(new_j,0),np.std(new_j,0)))
     # print("Mean particle: {}, std particle: {}".format(np.mean(new_p,0),np.std(new_p,0)))
+    # input()
     #Reshape it back
     new_j = np.reshape(new_j,jet.shape)
     new_p = np.reshape(new_p,particle.shape)
     
-    return new_j, new_p
+    return new_j, new_p, mjj
 
 
 
@@ -170,15 +208,21 @@ if __name__ == "__main__":
     parser.add_argument('--config', default='config_jet.json', help='Training parameters')    
     parser.add_argument('--SR', action='store_true', default=False,help='Load signal region background events')
     parser.add_argument('--hamb', action='store_true', default=False,help='Load Hamburg team dataset')
+    parser.add_argument('--reweight', action='store_true', default=False,help='Apply mjj based reweighting to SR events')
     parser.add_argument('--nsig', type=int,default=2500,help='Number of injected signal events')
     parser.add_argument('--nbkg', type=int,default=100000,help='Number of injected signal events')
     parser.add_argument('--nid', type=int,default=0,help='Independent training ID')
 
+    
+    parser.add_argument('--LR', type=float,default=1e-4,help='learning rate')
+    parser.add_argument('--MAX-EPOCH', type=int,default=300,help='maximum number of epochs for the training')
+    parser.add_argument('--BATCH-SIZE', type=int,default=64,help='Batch size')
+
     flags = parser.parse_args()
     config = utils.LoadJson(flags.config)
-    MAX_EPOCH = 300
-    BATCH_SIZE = 64
-    LR = 1e-4
+    MAX_EPOCH = flags.MAX_EPOCH
+    BATCH_SIZE =flags.BATCH_SIZE
+    LR = flags.LR
 
     data_j,data_p,data_mjj,labels = class_loader(flags.data_folder,
                                                  flags.file_name,
@@ -190,7 +234,7 @@ if __name__ == "__main__":
                                                  mjjmin=config['MJJMIN']
                                                  )
 
-    data_j,data_p = combine_part_jet(data_j,data_p,data_mjj,npart=flags.npart)
+    data_j,data_p,data_mjj = combine_part_jet(data_j,data_p,data_mjj,npart=flags.npart)
     sample_name = config['MODEL_NAME'] if flags.hamb==False else 'Hamburg'
     if flags.test:sample_name = 'supervised'
     
@@ -205,16 +249,15 @@ if __name__ == "__main__":
         bkg_j = bkg_j[hvd.rank()::hvd.size()]
         bkg_mjj = bkg_mjj[hvd.rank()::hvd.size()]
     elif flags.hamb:
-        with h5.File(os.path.join(flags.data_folder,'generated_data_datacond.h5'),"r") as h5f:
+        with h5.File(os.path.join(flags.data_folder,'generated_data_datacond_both_jets.h5'),"r") as h5f:
             bkg_p = np.stack([
                 h5f['particle_data_rel_x'][hvd.rank()::hvd.size()],
                 h5f['particle_data_rel_y'][hvd.rank()::hvd.size()]],1)
-            #bkg_p = bkg_p[:,:,:,[2,0,1]]
-            npart = np.sum(bkg_p[:,:,:,0]>0,2)
             bkg_j = np.stack([
                 h5f['jet_features_x'][hvd.rank()::hvd.size()],
                 h5f['jet_features_y'][hvd.rank()::hvd.size()]],1)
-            bkg_j = np.concatenate([bkg_j,np.expand_dims(npart,-1)],-1)
+            npart = np.sum(bkg_p[:,:,:,0]>0,2)
+            bkg_j[:,:,-1] = npart
             bkg_mjj = h5f['mjj'][hvd.rank()::hvd.size()]
     else:
         with h5.File(os.path.join(flags.data_folder,sample_name+'.h5'),"r") as h5f:
@@ -223,8 +266,12 @@ if __name__ == "__main__":
             bkg_mjj = h5f['mjj'][hvd.rank()::hvd.size()]
             
 
-        
-    bkg_j,bkg_p = combine_part_jet(bkg_j,bkg_p,bkg_mjj,npart=flags.npart)
+    data_size = int(bkg_j.shape[0] + data_j.shape[0])
+    bkg_j,bkg_p,bkg_mjj = combine_part_jet(bkg_j,bkg_p,bkg_mjj,npart=flags.npart)
+    #Using recalculated values of mjj, let's apply the sideband/signal region cuts again
+    bkg_j,bkg_p,bkg_mjj = apply_mjj_cut(bkg_j,bkg_p,bkg_mjj,flags.SR,
+                                        mjjmin=config['MJJMIN'],mjjmax=config['MJJMAX'])
+    
     if hvd.rank()==0:
         print("Loading {} generated samples and {} data samples".format(bkg_j.shape[0],data_j.shape[0]))
     semi_labels = np.concatenate([np.zeros(bkg_j.shape[0]),np.ones(data_j.shape[0])],0)
@@ -236,7 +283,7 @@ if __name__ == "__main__":
 
     mask = sample_p[:,:,:,0]!=0        
     model = get_classifier(flags.SR)
-    compile(model,MAX_EPOCH,BATCH_SIZE,LR,int(0.9*sample_j.shape[0]))
+    compile(model,MAX_EPOCH,BATCH_SIZE,LR,int(0.9*data_size))
     callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0),
                  hvd.callbacks.MetricAverageCallback(),
                  EarlyStopping(patience=50,restore_best_weights=True)]
@@ -255,17 +302,18 @@ if __name__ == "__main__":
         weights = np.ones(sample_j.shape[0])
             
     elif flags.SR:
-        #weights = np.ones(sample_j.shape[0])
-        if hvd.rank()==0:print("Loading weights...")
-        model_weight = get_classifier(SR=False)
-        model_weight.load_weights('../checkpoints/{}_class/checkpoint'.format(config['MODEL_NAME'])).expect_partial()
-        weights = utils.reweight(bkg_j,bkg_p,model_weight,
-                                 utils.prep_mjj(bkg_mjj,
-                                                mjjmin=config['MJJMIN'],
-                                                mjjmax=config['MJJMAX']),
-                                 )
-        weights = np.concatenate([weights,np.ones(data_j.shape[0])])
-        
+        if flags.reweight:
+            if hvd.rank()==0:print("Loading weights...")
+            model_weight = get_classifier(SR=False)
+            model_weight.load_weights('../checkpoints/{}_class/checkpoint'.format(config['MODEL_NAME'])).expect_partial()
+            weights = utils.reweight(bkg_j,bkg_p,model_weight,
+                                     utils.prep_mjj(bkg_mjj,
+                                                    mjjmin=config['MJJMIN'],
+                                                    mjjmax=config['MJJMAX']),
+                                     )
+            weights = np.concatenate([weights,np.ones(data_j.shape[0])])
+        else:
+            weights = np.ones(sample_j.shape[0])
         
     sample_j,sample_p,semi_labels,mask,mjj,weights = shuffle(sample_j,sample_p,
                                                              semi_labels,mask,
@@ -280,6 +328,8 @@ if __name__ == "__main__":
               sample_weight = weights,
               epochs=MAX_EPOCH,shuffle=True,
               verbose=hvd.rank()==0,
+              steps_per_epoch=int(data_size*0.9/BATCH_SIZE),
+              validation_steps=int(data_size*0.1/BATCH_SIZE)
               )
 
     if hvd.rank() == 0:

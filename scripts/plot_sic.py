@@ -31,23 +31,25 @@ if __name__ == "__main__":
     parser.add_argument('--config', default='config_jet.json', help='Training parameters')    
     parser.add_argument('--nbkg', type=int,default=100000,help='Number of injected signal events')
     parser.add_argument('--nid', type=int,default=1,help='Number of independent trainings performed')
+    parser.add_argument('--load', action='store_true', default=False,help='Load classifier results form previous evaluation')
 
     
     flags = parser.parse_args()
     config = utils.LoadJson(flags.config)
 
-    
+
     data_jet,data_part,data_mjj,labels = class_loader(flags.data_folder,
-                                               flags.file_name,
-                                               npart=flags.npart,
-                                               use_SR=True,
-                                               nsig = 100000,
-                                               nbkg = 100000,
-                                               mjjmax=config['MJJMAX'],
-                                               mjjmin=config['MJJMIN']
-                                               )
-    data_j,data_p = combine_part_jet(data_jet,data_part,data_mjj,npart=flags.npart)
+                                                      flags.file_name,
+                                                      npart=flags.npart,
+                                                      use_SR=True,
+                                                      nsig = 100000,
+                                                      nbkg = 100000,
+                                                      mjjmax=config['MJJMAX'],
+                                                      mjjmin=config['MJJMIN']
+                                                      )
+    data_j,data_p,data_mjj = combine_part_jet(data_jet,data_part,data_mjj,npart=flags.npart)
     mask_data = data_p[:,:,:,0]!=0
+        
     nsigs = [500,1000,2000,3000,4000,5000,6000,7000,10000]
     models = {
         #'Hamburg': 'Flow Matching',
@@ -64,13 +66,18 @@ if __name__ == "__main__":
         for sample_name in models.keys():
             means = []
             for nid in range(flags.nid): #Load independent trainings
-                checkpoint_folder = '../checkpoints/{}_SR_nsig_{}_nbkg_{}_nid{}/checkpoint'.format(sample_name,
-                                                                                       nsig,flags.nbkg,
-                                                                                       nid)
-                model.load_weights(checkpoint_folder).expect_partial()
-                pred = model.predict([data_j,data_p,mask_data],batch_size=2000)
-                fpr, tpr, _ = roc_curve(labels,pred, pos_label=1)
+
+                if flags.load:
+                    pred = np.load('../pred/pred_{}_SR_nsig_{}_nbkg_{}_nid{}.npy'.format(sample_name,nsig,flags.nbkg,nid))
                 
+                else:
+                    checkpoint_folder = '../checkpoints/{}_SR_nsig_{}_nbkg_{}_nid{}/checkpoint'.format(sample_name,
+                                                                                                       nsig,flags.nbkg,nid)
+                    model.load_weights(checkpoint_folder).expect_partial()
+                    pred = model.predict([data_j,data_p,mask_data],batch_size=2000)
+                    np.save('../pred/pred_{}_SR_nsig_{}_nbkg_{}_nid{}'.format(sample_name,nsig,flags.nbkg,nid),pred)
+                    
+                fpr, tpr, _ = roc_curve(labels,pred, pos_label=1)
                 auc_res =auc(fpr, tpr)
                 print("AUC: {}".format(auc_res))
                 sic = np.ma.divide(tpr,np.sqrt(fpr)).filled(0)

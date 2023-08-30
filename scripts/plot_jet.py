@@ -20,9 +20,9 @@ def get_mjj(particle,jet):
     new_p[:,:,:,2]+=np.expand_dims(jet[:,:,2],-1)
     
     #fix phi
-    new_p[:,:,:,2][new_p[:,:,:,2]>np.pi] -= 2*np.pi
-    new_p[:,:,:,2][new_p[:,:,:,2]<-np.pi] += 2*np.pi
-    mask = np.expand_dims(new_p[:,:,:,0]>2.53e-05,-1)
+    # new_p[:,:,:,2][new_p[:,:,:,2]>np.pi] -= 2*np.pi
+    # new_p[:,:,:,2][new_p[:,:,:,2]<-np.pi] += 2*np.pi
+    mask = np.expand_dims(new_p[:,:,:,0]!=0,-1)
     new_p*=mask
     #Flatten particles
     #new_p = np.reshape(new_p,(-1,new_p.shape[1]*new_p.shape[2],new_p.shape[-1]))
@@ -144,18 +144,15 @@ if __name__ == "__main__":
                 
         elif flags.hamb:
             assert flags.SR, "ERROR: Hamburg files available only at SR"
-            with h5.File(os.path.join(flags.data_folder,'generated_data_datacond.h5'),"r") as h5f:
+            with h5.File(os.path.join(flags.data_folder,'generated_data_datacond_both_jets.h5'),"r") as h5f:
                 particles_gen = np.stack([
                     h5f['particle_data_rel_x'][:],
                     h5f['particle_data_rel_y'][:]],1)
-                npart = np.sum(particles_gen[:,:,:,0]>0,2)
 
-                #particles_gen = particles_gen[:,:,:,[2,0,1]]
                 jets_gen = np.stack([
                     h5f['jet_features_x'][:],
                     h5f['jet_features_y'][:]],1)
 
-                jets_gen = np.concatenate([jets_gen,np.expand_dims(npart,-1)],-1)
                 mjj_gen = h5f['mjj'][:]
                 
         else:
